@@ -4,8 +4,9 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
 } from 'recharts'
 
-const REFRESH_MS = 30_000 // re-poll every 30s
-const API_BASE = import.meta.env.VITE_API_URL // set in Vercel; empty locally
+const REFRESH_MS = 60_000
+const API_BASE = import.meta.env.VITE_API_URL
+
 const SEVERITY_COLORS = {
   Critical: '#e34948',
   High: '#eb6834',
@@ -14,8 +15,17 @@ const SEVERITY_COLORS = {
   Informational: '#6b7280',
 }
 
+const STATUS_MAP = {
+  1: 'New',
+  2: 'In Progress',
+  3: 'Pending Client',
+  4: 'Pending SOC',
+  5: 'On Hold',
+  6: 'Resolved',
+  7: 'Closed',
+}
+
 function todayKey() {
-  // YYYY-MM-DD in the browser's local timezone
   const d = new Date()
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
@@ -29,12 +39,12 @@ function severityBadgeClass(name) {
   return 'badge badge-low'
 }
 
-// Backend now sends a ready-made statusLabel (Created / Assigned /
-// Acknowledged / In Progress / Pending Client / Pending SOC / Blocked /
-// On Hold / Resolved / Closed - ...) based on the numeric incidentStatus
-// code -- no more guessing from custom-field text.
 function statusLabel(incident) {
-  return incident.statusLabel || (incident.isClosed ? 'Closed' : 'Open')
+  if (incident.statusLabel) return incident.statusLabel
+  if (incident.incidentStatus && STATUS_MAP[incident.incidentStatus]) {
+    return STATUS_MAP[incident.incidentStatus]
+  }
+  return incident.isClosed ? 'Closed' : 'Open'
 }
 
 function statusBadgeClass(incident) {
@@ -46,88 +56,131 @@ function statusBadgeClass(incident) {
   return 'badge badge-open'
 }
 
+function isUnassigned(incident) {
+  const name = incident.assigneeName
+  if (!name) return true
+  const trimmed = String(name).trim()
+  return trimmed === '' || trimmed.toLowerCase() === 'unassigned'
+}
+
+function isIncidentClosed(incident) {
+  if (typeof incident.isClosed === 'boolean') return incident.isClosed
+  const label = statusLabel(incident)
+  return label === 'Closed' || label === 'Resolved' || Number(incident.incidentStatus) === 6 || Number(incident.incidentStatus) === 7
+}
+
+// SLA status derived directly from slaStatusCode: 1 = Pending, 2 = Met,
+// 3 = Breached. Computed here in the frontend itself (not just trusted
+// from the backend's slaStatusLabel) so the mapping holds even against an
+// older/cached response from before the backend-side fix was deployed.
+function slaStatusFromCode(code) {
+  const numeric = Number(code)
+  if (numeric === 1) return 'Pending'
+  if (numeric === 2) return 'Met'
+  if (numeric === 3) return 'Breached'
+  return 'Unknown'
+}
+
+// Prefer the backend's slaStatusLabel when present (it's the same mapping,
+// computed server-side); fall back to computing it here directly from
+// slaStatusCode if the label is missing.
+function slaStatusLabel(i) {
+  if (i?.slaStatusLabel) return i.slaStatusLabel
+  return slaStatusFromCode(i?.slaStatusCode)
+}
+
+// SLA Breached: prefer the backend's explicit boolean; fall back to
+// deriving it from slaStatusCode === 3 directly if that boolean is missing.
+function isSlaBreached(i) {
+  if (typeof i?.slaBreached === 'boolean') return i.slaBreached
+  return slaStatusFromCode(i?.slaStatusCode) === 'Breached'
+}
+
+function slaBadgeStyle(label) {
+  if (label === 'Breached') return { color: 'var(--danger)', fontWeight: 600 }
+  if (label === 'Met') return { color: 'var(--success)', fontWeight: 600 }
+  if (label === 'Pending') return { color: 'var(--warning)', fontWeight: 600 }
+  return { color: 'var(--text-secondary)' }
+}
+
+function getSlaResolutionTime(i) {
+  const target = i.slaResolutionDue || i.resolutionSlaTime || i.slaTarget || i.detectionDateTime || i.createdAt
+  return target ? new Date(target).getTime() : 0
+}
+
 export default function App() {
   const [payload, setPayload] = useState(null)
   const [error, setError] = useState(null)
   const [pending, setPending] = useState(null)
+  const [openData, setOpenData] = useState(null)
 
   useEffect(() => {
     let cancelled = false
-
     async function load() {
       try {
         const url = API_BASE
           ? `${API_BASE}/api/incidents/latest?t=${Date.now()}`
           : `/data/incidents_latest.json?t=${Date.now()}`
-        const res = await fetch(url)
+        const res = await fetch(url, { cache: 'no-store' })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const json = await res.json()
         if (!cancelled) {
-          setPayload(json)
+          const extractedIncidents = json?.data?.incidents ?? json?.incidents ?? []
+          setPayload({
+            ...json,
+            incidents: extractedIncidents,
+            date: json?.data?.date || json?.date || todayKey(),
+            generatedAt: json?.data?.generatedAt || json?.generatedAt || new Date().toISOString()
+          })
           setError(null)
         }
       } catch (e) {
         if (!cancelled) setError(e.message)
       }
     }
-
     load()
     const interval = setInterval(load, REFRESH_MS)
     return () => { cancelled = true; clearInterval(interval) }
   }, [])
 
-  // Separate feed: Pending with Client / Pending with SOC / On Hold totals
-  // and per-assignee breakdown, computed backend-side from the pending
-  // window (from PENDING_SINCE_DATE, effectively "from the beginning") so
-  // older still-open tickets don't disappear once the day rolls over.
-  // Non-fatal if it fails -- the rest of the dashboard still works.
   useEffect(() => {
     let cancelled = false
-
     async function loadPending() {
       try {
         const url = API_BASE
           ? `${API_BASE}/api/incidents/pending?t=${Date.now()}`
           : `/data/pending_latest.json?t=${Date.now()}`
-        const res = await fetch(url)
+        const res = await fetch(url, { cache: 'no-store' })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const json = await res.json()
-        if (!cancelled) setPending(json)
+        if (!cancelled) setPending(json?.data ?? json)
       } catch (e) {
         console.warn('Could not load pending summary:', e.message)
       }
     }
-
     loadPending()
     const interval = setInterval(loadPending, REFRESH_MS)
     return () => { cancelled = true; clearInterval(interval) }
   }, [])
 
-  // Separate feed: every currently-open incident regardless of creation
-  // date (In Progress, Pending Client, Pending SOC, On Hold, Blocked,
-  // etc.), computed backend-side from the same wide pending window. This
-  // is what the "Open incidents" table below uses -- /api/incidents/latest
-  // alone only covers today's incidents, so an older still-open ticket
-  // (e.g. started In Progress yesterday) would otherwise never show up.
-  const [openData, setOpenData] = useState(null)
-
   useEffect(() => {
     let cancelled = false
-
     async function loadOpen() {
       try {
         const url = API_BASE
           ? `${API_BASE}/api/incidents/open?t=${Date.now()}`
           : `/data/open_latest.json?t=${Date.now()}`
-        const res = await fetch(url)
+        const res = await fetch(url, { cache: 'no-store' })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const json = await res.json()
-        if (!cancelled) setOpenData(json)
+        if (!cancelled) {
+          const extractedOpen = json?.data?.incidents ?? json?.incidents ?? []
+          setOpenData({ ...json, incidents: extractedOpen })
+        }
       } catch (e) {
         console.warn('Could not load open-incidents feed:', e.message)
       }
     }
-
     loadOpen()
     const interval = setInterval(loadOpen, REFRESH_MS)
     return () => { cancelled = true; clearInterval(interval) }
@@ -138,10 +191,11 @@ export default function App() {
 
   const kpis = useMemo(() => {
     const total = incidents.length
-    const closed = incidents.filter((i) => i.isClosed).length
+    const closed = incidents.filter(isIncidentClosed).length
     const open = total - closed
-    const slaBreached = incidents.filter((i) => i.slaBreached).length
-    return { total, open, closed, slaBreached }
+    const slaBreached = incidents.filter(isSlaBreached).length
+    const unassigned = incidents.filter(isUnassigned).length
+    return { total, open, closed, slaBreached, unassigned }
   }, [incidents])
 
   const severityData = useMemo(() => {
@@ -166,17 +220,20 @@ export default function App() {
     return buckets
   }, [incidents])
 
-  // Backend already filters to non-closed and sorts by severity -- this
-  // covers every open status (In Progress, Pending Client, Pending SOC,
-  // On Hold, Blocked, etc.) no matter when the incident was created.
-  const openIncidents = openData?.incidents ?? []
+  const openIncidents = useMemo(() => {
+    const rawList = openData?.incidents?.length
+      ? [...openData.incidents]
+      : incidents.filter((i) => !isIncidentClosed(i))
+
+    return rawList.sort((a, b) => getSlaResolutionTime(b) - getSlaResolutionTime(a))
+  }, [openData, incidents])
 
   const closedByClient = useMemo(() => {
     const map = {}
     incidents.forEach((i) => {
-      const client = i.clientName || 'Unknown'
+      const client = i.tenantName || i.clientName || 'Unknown'
       if (!map[client]) map[client] = { client, open: 0, closed: 0 }
-      if (i.isClosed) map[client].closed += 1
+      if (isIncidentClosed(i)) map[client].closed += 1
       else map[client].open += 1
     })
     return Object.values(map).sort((a, b) => (b.open + b.closed) - (a.open + a.closed))
@@ -184,7 +241,7 @@ export default function App() {
 
   const resolverLeaderboard = useMemo(() => {
     const counts = {}
-    incidents.filter((i) => i.isClosed).forEach((i) => {
+    incidents.filter(isIncidentClosed).forEach((i) => {
       const name = i.assigneeName || 'Unassigned'
       counts[name] = (counts[name] || 0) + 1
     })
@@ -213,7 +270,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Row: KPI cards */}
       <div className="kpi-row">
         <div className="kpi-card">
           <p className="label">Total incidents today</p>
@@ -231,9 +287,12 @@ export default function App() {
           <p className="label">SLA breached</p>
           <p className="value" style={{ color: 'var(--warning)' }}>{kpis.slaBreached}</p>
         </div>
+        <div className="kpi-card">
+          <p className="label">Unassigned</p>
+          <p className="value" style={{ color: 'var(--warning)' }}>{kpis.unassigned}</p>
+        </div>
       </div>
 
-      {/* Row: Pending detections by assignee | Incidents by hour of day */}
       <div className="row-2col">
         <div className="panel">
           <h2>
@@ -284,7 +343,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Row: By severity (donut) | Pending with client | Pending with SOC | On hold */}
       <div className="row-severity">
         <div className="panel">
           <h2>By severity</h2>
@@ -326,7 +384,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Row: Open incidents (full width, scrolls internally) */}
       <div className="panel row-open">
         <h2>Open incidents ({openIncidents.length})</h2>
         <div className="panel-body">
@@ -336,6 +393,7 @@ export default function App() {
             <table>
               <thead>
                 <tr>
+                  <th>ID</th>
                   <th>Client</th>
                   <th>Severity</th>
                   <th>Status</th>
@@ -345,25 +403,27 @@ export default function App() {
                 </tr>
               </thead>
               <tbody>
-                {openIncidents.map((i) => (
-                  <tr key={i.id}>
-                    <td>{i.clientName}</td>
-                    <td><span className={severityBadgeClass(i.severityName)}>{i.severityName}</span></td>
-                    <td><span className={statusBadgeClass(i)}>{statusLabel(i)}</span></td>
-                    <td>{i.assigneeName || '—'}</td>
-                    <td className={i.slaBreached ? 'badge-breached' : 'badge-ontrack'}>
-                      {i.slaBreached ? 'Breached' : 'On track'}
-                    </td>
-                    <td>{i.title}</td>
-                  </tr>
-                ))}
+                {openIncidents.map((i) => {
+                  const label = slaStatusLabel(i)
+                  const incidentId = i.id || i.incidentId || i._id || '—'
+                  return (
+                    <tr key={incidentId}>
+                      <td>{incidentId}</td>
+                      <td>{i.tenantName || i.clientName || '—'}</td>
+                      <td><span className={severityBadgeClass(i.severityName)}>{i.severityName}</span></td>
+                      <td><span className={statusBadgeClass(i)}>{statusLabel(i)}</span></td>
+                      <td>{i.assigneeName || '—'}</td>
+                      <td style={slaBadgeStyle(label)}>{label}</td>
+                      <td>{i.title}</td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           )}
         </div>
       </div>
 
-      {/* Row: Closed vs open by client | Top resolvers today */}
       <div className="row-2col">
         <div className="panel">
           <h2>Closed vs open by client</h2>

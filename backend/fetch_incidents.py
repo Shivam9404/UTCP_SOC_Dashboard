@@ -22,6 +22,18 @@ every refresh and be faster/lighter on the API. If you'd rather go back to
 the old rolling-window behaviour, set PENDING_SINCE_DATE="" (empty) in
 .env and PENDING_LOOKBACK_DAYS will be used instead.
 
+RATE LIMITING: Vigilhawk doesn't appear to advertise a rate limit via
+response headers (checked in Postman -- no X-RateLimit-* / Retry-After
+present under normal conditions). Rather than guess a "safe" polling
+interval, fetch_page() below now detects a 429 (Too Many Requests) response
+if one ever happens and backs off automatically -- honoring the API's
+Retry-After header if it sends one on that response, otherwise an
+increasing wait -- then retries, up to MAX_RETRIES times. Same automatic
+backoff applies to transient 5xx server errors. This means REFRESH_INTERVAL_
+MINUTES (in server.py) can just be left at whatever you want for freshness;
+if it's ever too aggressive, this file slows itself down on its own instead
+of failing or needing you to manually re-tune anything.
+
 This file does NOT need to be run by hand. server.py imports the functions
 below and re-runs this same logic automatically on a schedule (see
 REFRESH_INTERVAL_MINUTES in server.py) as long as server.py is left
@@ -67,6 +79,7 @@ CLOSED_STATUS_CODES in backend/.env -- no code changes needed.
 import os
 import sys
 import json
+import time
 import smtplib
 import argparse
 from datetime import datetime, timedelta, date
@@ -98,6 +111,14 @@ EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USERNAME)
 EMAIL_TO = os.getenv("EMAIL_TO")
 
 # --------------------------------------------------------------------------
+# Rate-limit self-defense (see module docstring)
+# --------------------------------------------------------------------------
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+# Used only if the API returns 429 WITHOUT a Retry-After header. Multiplied
+# by the attempt number, so wait time increases each retry (30s, 60s, 90s...).
+DEFAULT_RETRY_AFTER_SECONDS = int(os.getenv("DEFAULT_RETRY_AFTER_SECONDS", "30"))
+
+# --------------------------------------------------------------------------
 # Pending window configuration
 # --------------------------------------------------------------------------
 # PENDING_SINCE_DATE: fixed calendar date (YYYY-MM-DD) the "pending" fetch
@@ -105,7 +126,7 @@ EMAIL_TO = os.getenv("EMAIL_TO")
 # rolling last-N-days window. Defaults to "2000-01-01", which in practice
 # means "everything the API has". Set this in backend/.env to your actual
 # go-live date once you know it, so every refresh pulls less data and is
-# faster and lighter on the API's rate limit.
+# faster and lighter on the API.
 #
 # To go back to the OLD behaviour (rolling N-day window instead of a fixed
 # start date), set PENDING_SINCE_DATE="" (empty string) in .env -- then
@@ -172,9 +193,18 @@ def day_bounds_str(target_date):
     return target_date.isoformat(), (target_date + timedelta(days=1)).isoformat()
 
 
-def fetch_page(start_date, end_date, page_index, page_size=PAGE_SIZE):
+def fetch_page(start_date, end_date, page_index, page_size=PAGE_SIZE, _attempt=1):
     """Fetch a single page of incidents. Matches the confirmed Postman
-    request: POST with a JSON body."""
+    request: POST with a JSON body.
+
+    Self-defending against rate limits: if the API responds 429 (Too Many
+    Requests), this waits and retries instead of failing outright -- using
+    the Retry-After response header if the API sends one, otherwise an
+    increasing backoff (DEFAULT_RETRY_AFTER_SECONDS x attempt number). Same
+    treatment for transient 5xx server errors. Gives up after MAX_RETRIES
+    attempts and raises normally, so a genuinely broken request still
+    surfaces instead of retrying forever.
+    """
     payload = {
         "pageIndex": page_index,
         "pageSize": page_size,
@@ -182,6 +212,25 @@ def fetch_page(start_date, end_date, page_index, page_size=PAGE_SIZE):
         "endDate": end_date,
     }
     resp = requests.post(API_BASE_URL, headers=auth_headers(), json=payload, timeout=30)
+
+    if resp.status_code == 429 and _attempt <= MAX_RETRIES:
+        retry_after = resp.headers.get("Retry-After")
+        try:
+            wait_seconds = int(retry_after) if retry_after else DEFAULT_RETRY_AFTER_SECONDS * _attempt
+        except ValueError:
+            wait_seconds = DEFAULT_RETRY_AFTER_SECONDS * _attempt
+        print(f"Rate limited (429) on page {page_index} -- waiting {wait_seconds}s before retry "
+              f"{_attempt}/{MAX_RETRIES}...")
+        time.sleep(wait_seconds)
+        return fetch_page(start_date, end_date, page_index, page_size, _attempt=_attempt + 1)
+
+    if resp.status_code >= 500 and _attempt <= MAX_RETRIES:
+        wait_seconds = min(60, 5 * _attempt)
+        print(f"API returned {resp.status_code} on page {page_index} -- retrying in {wait_seconds}s "
+              f"({_attempt}/{MAX_RETRIES})...")
+        time.sleep(wait_seconds)
+        return fetch_page(start_date, end_date, page_index, page_size, _attempt=_attempt + 1)
+
     if not resp.ok:
         print(f"API returned {resp.status_code} for payload {payload}")
         print(f"Response body: {resp.text}")
@@ -279,11 +328,47 @@ def flatten_incident(inc):
 
     flat["statusLabel"] = STATUS_LABELS.get(flat["incidentStatusCode"], "Unknown")
     flat["isClosed"] = flat["incidentStatusCode"] in CLOSED_STATUS_CODES
-    flat["slaBreached"] = bool(flat.get("slaStatusCode")) and flat["slaStatusCode"] not in (0, None) or (
-        flat["timeToResolveMinutes"] is not None and flat["timeToResolveMinutes"] < 0
-    )
+
+    sla_label, is_breached = compute_sla_status(flat)
+    flat["slaStatusLabel"] = sla_label
+    flat["slaBreached"] = is_breached
 
     return flat
+
+
+# --------------------------------------------------------------------------
+# SLA status mapping: 1 = Pending, 2 = Met, 3 = Breached (confirmed values).
+# If your tenant uses different numbers for any of these, override via
+# SLA_STATUS_PENDING_CODE / SLA_STATUS_MET_CODE / SLA_STATUS_BREACHED_CODE
+# in backend/.env -- no code changes needed.
+# --------------------------------------------------------------------------
+SLA_STATUS_PENDING_CODE = int(os.getenv("SLA_STATUS_PENDING_CODE", "1"))
+SLA_STATUS_MET_CODE = int(os.getenv("SLA_STATUS_MET_CODE", "2"))
+SLA_STATUS_BREACHED_CODE = int(os.getenv("SLA_STATUS_BREACHED_CODE", "3"))
+
+SLA_STATUS_LABELS = {
+    SLA_STATUS_PENDING_CODE: "Pending",
+    SLA_STATUS_MET_CODE: "Met",
+    SLA_STATUS_BREACHED_CODE: "Breached",
+}
+
+
+def compute_sla_status(flat):
+    """Returns (slaStatusLabel: str, isBreached: bool) purely from
+    slaStatusCode -- 1 = Pending, 2 = Met, 3 = Breached.
+
+    Deliberately NOT using slaDueDateTime/resolutionDateTime math anymore --
+    this tenant's slaStatusCode is the source of truth per confirmed
+    mapping. Any code that isn't 1/2/3 (e.g. 0, or anything else not yet
+    seen) comes back as "Unknown" rather than silently guessing. If
+    "Unknown" shows up a lot on the dashboard, that's a sign there's a code
+    in play that isn't in this mapping -- tell me the code and what it
+    means and I'll add it.
+    """
+    code = flat.get("slaStatusCode")
+    label = SLA_STATUS_LABELS.get(code, "Unknown")
+    is_breached = code == SLA_STATUS_BREACHED_CODE
+    return label, is_breached
 
 
 # --------------------------------------------------------------------------
@@ -516,13 +601,11 @@ def send_assignee_reminder_emails(today, open_incidents):
 def inspect_pending_statuses():
     """Run: python fetch_incidents.py --inspect-statuses
 
-    Prints every value found for every cf_* field (plus incidentStatusCode /
-    slaStatusCode) across all currently-open incidents in the pending
-    window, with counts. Use this to find the *actual* field name and
-    *actual* wording your API uses for "Pending with Client" / "Pending
-    with SOC" / "On Hold", instead of guessing -- then set
-    PENDING_STATUS_FIELD and the three STATUS_*_MATCH values in .env to
-    match. No code changes needed once you know the real values.
+    Prints every value found for incidentStatusCode (plus slaStatusCode)
+    across all currently-open incidents in the pending window, with counts.
+    Use this to sanity-check that STATUS_PENDING_CLIENT_CODE /
+    STATUS_PENDING_SOC_CODE / STATUS_ON_HOLD_CODE / CLOSED_STATUS_CODES in
+    .env actually match what the API is sending back.
     """
     flattened = fetch_pending_window_incidents()
     open_only = [f for f in flattened if not f["isClosed"]]
@@ -547,6 +630,17 @@ def inspect_pending_statuses():
         print(f"  {count:>4}  code={code!r:>4}  ({label})")
     print()
 
+    sla_counts = {}
+    for f in flattened:  # SLA status is meaningful on closed incidents too, so use everything, not just open_only
+        code = f.get("slaStatusCode")
+        sla_counts[code] = sla_counts.get(code, 0) + 1
+
+    print("--- slaStatusCode (ALL incidents in this window, open + closed) ---")
+    for code, count in sorted(sla_counts.items(), key=lambda kv: -kv[1]):
+        label = SLA_STATUS_LABELS.get(code, "Unknown")
+        print(f"  {count:>4}  code={code!r:>4}  ({label})")
+    print()
+
     print("Currently configured (backend/.env):")
     print(f"  PENDING_SINCE_DATE        = {PENDING_SINCE_DATE!r}")
     print(f"  PENDING_LOOKBACK_DAYS     = {PENDING_LOOKBACK_DAYS!r} (only used if PENDING_SINCE_DATE is empty)")
@@ -554,6 +648,9 @@ def inspect_pending_statuses():
     print(f"  STATUS_PENDING_SOC_CODE    = {STATUS_PENDING_SOC_CODE!r}")
     print(f"  STATUS_ON_HOLD_CODE        = {STATUS_ON_HOLD_CODE!r}")
     print(f"  CLOSED_STATUS_CODES        = {sorted(CLOSED_STATUS_CODES)!r}")
+    print(f"  SLA_STATUS_PENDING_CODE    = {SLA_STATUS_PENDING_CODE!r}")
+    print(f"  SLA_STATUS_MET_CODE        = {SLA_STATUS_MET_CODE!r}")
+    print(f"  SLA_STATUS_BREACHED_CODE   = {SLA_STATUS_BREACHED_CODE!r}")
     print("\nIf any code above doesn't match STATUS_LABELS, or a code you expected to see as "
           "pending/closed is missing from the right list, update the matching *_CODE / "
           "CLOSED_STATUS_CODES env var in backend/.env.")
@@ -567,8 +664,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--eod", action="store_true", help="Run end-of-day check and send escalation emails for anything still open.")
     parser.add_argument("--inspect-statuses", action="store_true",
-                         help="Print real status field names/values from the API to help configure "
-                              "PENDING_STATUS_FIELD and the STATUS_*_MATCH env vars, then exit.")
+                         help="Print real status codes/values from the API to help sanity-check the "
+                              "STATUS_*_CODE and CLOSED_STATUS_CODES env vars, then exit.")
     args = parser.parse_args()
 
     if not API_BASE_URL or not API_KEY:
