@@ -1,12 +1,14 @@
 """
 server.py
 
-Wraps fetch_incidents.py as a small live API so the dashboard can be deployed
-on the web: frontend on Vercel, this on Render.
+Wraps fetch_incidents.py as a small live API so the dashboard runs
+completely on its own -- nobody needs to run any script by hand, ever, once
+this process is deployed and left running (Render, systemd, pm2, Docker,
+whatever fits your setup).
 
 What it does:
 - Runs the same logic as fetch_incidents.py on a background schedule
-  (refresh every REFRESH_INTERVAL_MINUTES, default 5; end-of-day email
+  (refresh every REFRESH_INTERVAL_MINUTES, default 1; end-of-day email
   check at 23:59) using APScheduler -- nobody needs to run any script by
   hand, this process does it on its own the whole time it's running.
 - Exposes GET /api/incidents/latest, returning today's flattened incidents
@@ -27,15 +29,17 @@ What it does:
   (today's plus older), plus a personal reminder email to each individual
   assignee for their own still-open items.
 
-IMPORTANT -- why this version is different from before: the previous
-version crashed the whole process if a single API call failed (e.g. bad
-credentials, a network blip, a rate limit) -- including the very first
-call made at startup, before the server or scheduler had even started.
-That crash would be silent unless you happened to be watching the
-terminal, and once the process died, nothing would auto-update again
-until you manually restarted it. Every refresh here is now wrapped so a
-failure is logged and the server keeps running and keeps retrying on
-schedule, instead of dying.
+REFRESH_INTERVAL_MINUTES is now 1 by default, so the dashboard reflects a
+new/updated detection within about a minute of it landing in Vigilhawk,
+with no manual runs ever needed -- this process, left running, is the whole
+"live data" pipeline. If Vigilhawk enforces an API rate limit, check it
+before leaving this at 1; raise the number (e.g. "2" or "5") in .env via
+REFRESH_INTERVAL_MINUTES if you start seeing 429s in the logs or in
+/healthz's lastError.
+
+Every refresh is wrapped so a single failed API call (bad credentials, a
+network blip, a rate limit) is logged and recorded in /healthz, but never
+kills the process -- the scheduler just tries again next interval.
 
 Local test: python server.py
 Render start command: gunicorn -w 1 -b 0.0.0.0:$PORT server:app
@@ -76,13 +80,14 @@ app = Flask(__name__)
 CORS(app)  # allow the Vercel-hosted frontend to call this API cross-origin
 
 # How often this server polls the Vigilhawk API on its own, with nobody
-# needing to run anything by hand. Lower this for fresher data at the cost
-# of more API calls; check your API's rate limit before going much below 2.
-# NOTE: if PENDING_SINCE_DATE (in fetch_incidents.py) pulls a lot of
+# needing to run anything by hand. Default is 1 minute -- lower it further
+# only if your API can comfortably take that; check Vigilhawk's rate limit
+# first. If PENDING_SINCE_DATE (in fetch_incidents.py) pulls a lot of
 # history, a single refresh can take a while -- if refreshes are taking
-# longer than this interval, raise REFRESH_INTERVAL_MINUTES or set
-# PENDING_SINCE_DATE to a more recent date so each fetch is smaller.
-REFRESH_INTERVAL_MINUTES = int(os.getenv("REFRESH_INTERVAL_MINUTES", "5"))
+# longer than this interval (see the "Refreshed:" timing in the logs),
+# raise REFRESH_INTERVAL_MINUTES or set PENDING_SINCE_DATE to a more recent
+# date so each fetch is smaller.
+REFRESH_INTERVAL_MINUTES = int(os.getenv("REFRESH_INTERVAL_MINUTES", "1"))
 
 _cache = {"date": None, "generatedAt": None, "count": 0, "incidents": []}
 _pending_cache = {"generatedAt": None, "sinceDate": None, "lookbackDays": None, "totals": {}, "byAssignee": []}

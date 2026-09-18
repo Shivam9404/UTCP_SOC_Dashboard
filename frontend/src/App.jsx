@@ -69,31 +69,28 @@ function isIncidentClosed(incident) {
   return label === 'Closed' || label === 'Resolved' || Number(incident.incidentStatus) === 6 || Number(incident.incidentStatus) === 7
 }
 
-// SLA status derived directly from slaStatusCode: 1 = Pending, 2 = Met,
-// 3 = Breached. Computed here in the frontend itself (not just trusted
-// from the backend's slaStatusLabel) so the mapping holds even against an
-// older/cached response from before the backend-side fix was deployed.
-function slaStatusFromCode(code) {
-  const numeric = Number(code)
-  if (numeric === 1) return 'Pending'
-  if (numeric === 2) return 'Met'
-  if (numeric === 3) return 'Breached'
-  return 'Unknown'
+const LOGGED_SLA_MINUTES = 15
+
+function loggedSlaStatusLabel(i) {
+  const detectedAt = i?.detectionDateTime ? new Date(i.detectionDateTime).getTime() : null
+  const loggedAt = i?.createdAt ? new Date(i.createdAt).getTime() : null
+  if (!detectedAt || !loggedAt) return 'Unknown'
+  const minutesToLog = (loggedAt - detectedAt) / 60000
+  return minutesToLog <= LOGGED_SLA_MINUTES ? 'Met' : 'Breached'
 }
 
-// Prefer the backend's slaStatusLabel when present (it's the same mapping,
-// computed server-side); fall back to computing it here directly from
-// slaStatusCode if the label is missing.
-function slaStatusLabel(i) {
-  if (i?.slaStatusLabel) return i.slaStatusLabel
-  return slaStatusFromCode(i?.slaStatusCode)
-}
+function resolutionSlaStatusLabel(i) {
+  const dueAt = i?.slaDueDateTime ? new Date(i.slaDueDateTime).getTime() : null
+  if (!dueAt) return 'Unknown'
 
-// SLA Breached: prefer the backend's explicit boolean; fall back to
-// deriving it from slaStatusCode === 3 directly if that boolean is missing.
-function isSlaBreached(i) {
-  if (typeof i?.slaBreached === 'boolean') return i.slaBreached
-  return slaStatusFromCode(i?.slaStatusCode) === 'Breached'
+  if (isIncidentClosed(i)) {
+    const resolvedAt = i?.resolutionDateTime || i?.cf_resolutionDateTime || i?.updatedAt
+    const resolvedTime = resolvedAt ? new Date(resolvedAt).getTime() : null
+    if (!resolvedTime) return 'Unknown'
+    return resolvedTime <= dueAt ? 'Met' : 'Breached'
+  }
+
+  return Date.now() > dueAt ? 'Breached' : 'Pending'
 }
 
 function slaBadgeStyle(label) {
@@ -193,9 +190,22 @@ export default function App() {
     const total = incidents.length
     const closed = incidents.filter(isIncidentClosed).length
     const open = total - closed
-    const slaBreached = incidents.filter(isSlaBreached).length
+
+    const loggedSlaMet = incidents.filter((i) => loggedSlaStatusLabel(i) === 'Met').length
+    const loggedSlaPending = incidents.filter((i) => loggedSlaStatusLabel(i) === 'Pending').length
+    const loggedSlaBreached = incidents.filter((i) => loggedSlaStatusLabel(i) === 'Breached').length
+
+    const resolutionSlaMet = incidents.filter((i) => resolutionSlaStatusLabel(i) === 'Met').length
+    const resolutionSlaPending = incidents.filter((i) => resolutionSlaStatusLabel(i) === 'Pending').length
+    const resolutionSlaBreached = incidents.filter((i) => resolutionSlaStatusLabel(i) === 'Breached').length
+
     const unassigned = incidents.filter(isUnassigned).length
-    return { total, open, closed, slaBreached, unassigned }
+    return {
+      total, open, closed,
+      loggedSlaMet, loggedSlaPending, loggedSlaBreached,
+      resolutionSlaMet, resolutionSlaPending, resolutionSlaBreached,
+      unassigned
+    }
   }, [incidents])
 
   const severityData = useMemo(() => {
@@ -283,9 +293,23 @@ export default function App() {
           <p className="label">Closed</p>
           <p className="value" style={{ color: 'var(--success)' }}>{kpis.closed}</p>
         </div>
-        <div className="kpi-card">
-          <p className="label">SLA breached</p>
-          <p className="value" style={{ color: 'var(--warning)' }}>{kpis.slaBreached}</p>
+        <div className="kpi-card" style={{ minWidth: 168 }}>
+          <p className="label">Logged SLA</p>
+          <p className="value" style={{ color: 'var(--warning)' }}>{kpis.loggedSlaBreached}</p>
+          <div style={{ display: 'flex', gap: 8, marginTop: 4, fontSize: 11, whiteSpace: 'nowrap' }}>
+            <span style={{ color: 'var(--success)' }}>Met {kpis.loggedSlaMet}</span>
+            <span style={{ color: 'var(--warning)' }}>Pending {kpis.loggedSlaPending}</span>
+            <span style={{ color: 'var(--danger)' }}>Breached {kpis.loggedSlaBreached}</span>
+          </div>
+        </div>
+        <div className="kpi-card" style={{ minWidth: 168 }}>
+          <p className="label">Resolution SLA</p>
+          <p className="value" style={{ color: 'var(--warning)' }}>{kpis.resolutionSlaBreached}</p>
+          <div style={{ display: 'flex', gap: 8, marginTop: 4, fontSize: 11, whiteSpace: 'nowrap' }}>
+            <span style={{ color: 'var(--success)' }}>Met {kpis.resolutionSlaMet}</span>
+            <span style={{ color: 'var(--warning)' }}>Pending {kpis.resolutionSlaPending}</span>
+            <span style={{ color: 'var(--danger)' }}>Breached {kpis.resolutionSlaBreached}</span>
+          </div>
         </div>
         <div className="kpi-card">
           <p className="label">Unassigned</p>
@@ -350,7 +374,7 @@ export default function App() {
             <div className="chart-body">
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
-                  <Pie data={severityData} dataKey="value" nameKey="name" innerRadius="55%" outerRadius="85%" paddingAngle={2}>
+                  <Pie data={severityData} dataKey="value" nameKey="name" innerRadius="80%" outerRadius="105%" paddingAngle={2}>
                     {severityData.map((entry) => (
                       <Cell key={entry.name} fill={SEVERITY_COLORS[entry.name]} />
                     ))}
@@ -371,15 +395,15 @@ export default function App() {
         </div>
 
         <div className="kpi-card pending-card">
-          <p className="label">Pending with client</p>
+          <p className="label">Total Pending with client</p>
           <p className="value" style={{ color: 'var(--warning)' }}>{pendingTotals.pendingWithClient ?? '—'}</p>
         </div>
         <div className="kpi-card pending-card">
-          <p className="label">Pending with SOC</p>
+          <p className="label">Total Pending with SOC</p>
           <p className="value" style={{ color: 'var(--danger)' }}>{pendingTotals.pendingWithSoc ?? '—'}</p>
         </div>
         <div className="kpi-card pending-card">
-          <p className="label">On hold</p>
+          <p className="label">Total On hold</p>
           <p className="value" style={{ color: 'var(--text-secondary)' }}>{pendingTotals.onHold ?? '—'}</p>
         </div>
       </div>
@@ -398,14 +422,19 @@ export default function App() {
                   <th>Severity</th>
                   <th>Status</th>
                   <th>Assignee</th>
-                  <th>SLA</th>
+                  <th>Logged SLA</th>
+                  <th>Resolution SLA</th>
                   <th>Title</th>
+                  <th>External URL</th>
                 </tr>
               </thead>
               <tbody>
                 {openIncidents.map((i) => {
-                  const label = slaStatusLabel(i)
+                  const loggedLabel = loggedSlaStatusLabel(i)
+                  const resolutionLabel = resolutionSlaStatusLabel(i)
                   const incidentId = i.id || i.incidentId || i._id || '—'
+                  const externalUrl = i.externalIncidentUrl || i.cf_cmdline || i.cf_url
+
                   return (
                     <tr key={incidentId}>
                       <td>{incidentId}</td>
@@ -413,8 +442,23 @@ export default function App() {
                       <td><span className={severityBadgeClass(i.severityName)}>{i.severityName}</span></td>
                       <td><span className={statusBadgeClass(i)}>{statusLabel(i)}</span></td>
                       <td>{i.assigneeName || '—'}</td>
-                      <td style={slaBadgeStyle(label)}>{label}</td>
+                      <td style={slaBadgeStyle(loggedLabel)}>{loggedLabel}</td>
+                      <td style={slaBadgeStyle(resolutionLabel)}>{resolutionLabel}</td>
                       <td>{i.title}</td>
+                      <td>
+                        {externalUrl ? (
+                          <a
+                            href={externalUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ color: 'var(--accent, #2a78d6)', textDecoration: 'underline' }}
+                          >
+                            Open Detection
+                          </a>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
                     </tr>
                   )
                 })}
