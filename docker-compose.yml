@@ -1,0 +1,12 @@
+services:
+  fetcher:
+    build:
+      context: ./backend
+    container_name: utcp-fetcher
+    env_file:
+      - ./backend/.env
+    environment:
+      OUTPUT_DIR: /app/data
+    volumes:
+      - ./frontend/public/data:/app/data
+    restart: unless-stopped

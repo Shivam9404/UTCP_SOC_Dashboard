@@ -231,12 +231,23 @@ export default function App() {
   }, [incidents])
 
   const openIncidents = useMemo(() => {
-    const rawList = openData?.incidents?.length
-      ? [...openData.incidents]
-      : incidents.filter((i) => !isIncidentClosed(i))
+  const rawList = openData?.incidents?.length
+    ? [...openData.incidents]
+    : incidents
 
-    return rawList.sort((a, b) => getSlaResolutionTime(b) - getSlaResolutionTime(a))
-  }, [openData, incidents])
+  return rawList
+    .filter((i) => {
+      const status = String(
+        i?.statusLabel ||
+        i?.status ||
+        i?.incidentStatusLabel ||
+        ''
+      ).trim().toLowerCase()
+
+      return status === 'pending client'
+    })
+    .sort((a, b) => getSlaResolutionTime(b) - getSlaResolutionTime(a))
+ }, [openData, incidents])
 
   const closedByClient = useMemo(() => {
     const map = {}
